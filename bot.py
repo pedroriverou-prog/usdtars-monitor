@@ -9,10 +9,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "3.0"))
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))  # segundos
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 
 last_alert_time = 0
-ALERT_COOLDOWN = 1800  # no repetir alerta por 30 minutos
+ALERT_COOLDOWN = 1800
 
 
 def send_telegram(message: str):
@@ -30,60 +30,101 @@ def send_telegram(message: str):
         logging.error(f"Error enviando Telegram: {e}")
 
 
-def fetch_spot_price() -> float | None:
-    """USDT/ARS precio spot en Binance."""
+def fetch_ars_price() -> float | None:
+    """USDT/ARS via criptoya.com — agrega precios de múltiples exchanges."""
+    sources = [
+        ("https://criptoya.com/api/usdt/ars/1", ["totalAsk", "totalBid", "ask", "bid"]),
+        ("https://api.bluelytics.com.ar/v2/latest", None),  # fallback dólar blue
+    ]
+    # Fuente 1: criptoya
     try:
-        res = requests.get(
-            "https://api.binance.com/api/v3/ticker/price",
-            params={"symbol": "USDTARS"},
-            timeout=10,
-        )
+        res = requests.get("https://criptoya.com/api/usdt/ars/1", timeout=10)
         res.raise_for_status()
-        return float(res.json()["price"])
+        data = res.json()
+        # Busca el precio en distintos exchanges conocidos
+        for exchange in ["lemoncash", "ripio", "belo", "buenbit", "satoshitango"]:
+            if exchange in data:
+                price = data[exchange].get("totalAsk") or data[exchange].get("ask")
+                if price:
+                    logging.info(f"Precio ARS obtenido de criptoya/{exchange}: {price}")
+                    return float(price)
     except Exception as e:
-        logging.warning(f"Error spot: {e}")
-        return None
+        logging.warning(f"Error criptoya: {e}")
+
+    # Fuente 2: dolarito
+    try:
+        res = requests.get("https://api.dolarito.ar/api/frontend/usdt", timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        price = data.get("sell") or data.get("buy")
+        if price:
+            logging.info(f"Precio ARS obtenido de dolarito: {price}")
+            return float(price)
+    except Exception as e:
+        logging.warning(f"Error dolarito: {e}")
+
+    # Fuente 3: bluelytics (dólar blue como referencia base)
+    try:
+        res = requests.get("https://api.bluelytics.com.ar/v2/latest", timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        price = data.get("blue", {}).get("value_sell")
+        if price:
+            logging.info(f"Precio ARS obtenido de bluelytics (blue): {price}")
+            return float(price)
+    except Exception as e:
+        logging.warning(f"Error bluelytics: {e}")
+
+    return None
 
 
 def fetch_p2p_price() -> float | None:
-    """USDT/ARS mejor precio P2P en Binance (compra)."""
+    """USDT/ARS P2P via criptoya — promedio de vendors P2P."""
     try:
-        body = {
-            "asset": "USDT",
-            "fiat": "ARS",
-            "merchantCheck": False,
-            "page": 1,
-            "payTypes": [],
-            "publisherType": None,
-            "rows": 5,
-            "tradeType": "BUY",
-        }
-        res = requests.post(
-            "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-            json=body,
-            timeout=10,
-        )
+        res = requests.get("https://criptoya.com/api/usdt/ars/1", timeout=10)
         res.raise_for_status()
         data = res.json()
-        if data.get("data"):
-            return float(data["data"][0]["adv"]["price"])
+        # Busca exchanges con mayor spread (más parecidos a P2P)
+        for exchange in ["fiwind", "decrypto", "tiendacrypto", "bitso"]:
+            if exchange in data:
+                price = data[exchange].get("totalAsk") or data[exchange].get("ask")
+                if price:
+                    logging.info(f"Precio P2P obtenido de criptoya/{exchange}: {price}")
+                    return float(price)
     except Exception as e:
-        logging.warning(f"Error P2P: {e}")
+        logging.warning(f"Error P2P criptoya: {e}")
     return None
 
 
 def fetch_ves_rate() -> float | None:
-    """Tasa de referencia USD/VES."""
+    """Tasa de referencia USD/VES via exchangerate.host (no requiere key)."""
+    try:
+        res = requests.get(
+            "https://open.er-api.com/v6/latest/USD",
+            timeout=10,
+        )
+        res.raise_for_status()
+        data = res.json()
+        ves = data.get("rates", {}).get("VES")
+        if ves:
+            return float(ves)
+    except Exception as e:
+        logging.warning(f"Error VES er-api: {e}")
+
+    # Fallback
     try:
         res = requests.get(
             "https://api.exchangerate-api.com/v4/latest/USD",
             timeout=10,
         )
         res.raise_for_status()
-        return res.json().get("rates", {}).get("VES")
+        ves = res.json().get("rates", {}).get("VES")
+        if ves:
+            return float(ves)
     except Exception as e:
-        logging.warning(f"Error VES: {e}")
-        return None
+        logging.warning(f"Error VES fallback: {e}")
+
+    return None
 
 
 def calculate_spread(spot: float, p2p: float) -> float:
@@ -92,7 +133,7 @@ def calculate_spread(spot: float, p2p: float) -> float:
 
 def format_alert(spot, p2p, ves, spread) -> str:
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
-    status = "🟢 <b>OPERAR AHORA</b>" if spread >= THRESHOLD_PCT else "🔴 Spread bajo"
+    status = "🟢 <b>OPERAR AHORA</b>" if spread >= THRESHOLD_PCT else "🔴 Spread bajo umbral"
     return (
         f"📊 <b>Monitor USDT — {now}</b>\n\n"
         f"🇦🇷 Spot (ARS): <b>${spot:,.0f}</b>\n"
@@ -113,7 +154,7 @@ def main():
     )
 
     while True:
-        spot = fetch_spot_price()
+        spot = fetch_ars_price()
         p2p = fetch_p2p_price()
         ves = fetch_ves_rate()
 
