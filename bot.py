@@ -147,31 +147,52 @@ def format_alert(spot, p2p, ves, spread) -> str:
 
 def main():
     global last_alert_time
-
+    
     logging.info("Bot iniciado. Umbral: %.1f%% | Intervalo: %ds", THRESHOLD_PCT, CHECK_INTERVAL)
-    send_telegram(
-        f"✅ <b>Bot iniciado</b>\nMonitoreando USDT/ARS cada {CHECK_INTERVAL}s\nUmbral de alerta: {THRESHOLD_PCT}%"
-    )
-
+    
+    offset = 0
+    price_check_time = 0
+    
     while True:
-        spot = fetch_ars_price()
-        p2p = fetch_p2p_price()
-        ves = fetch_ves_rate()
-
-        if spot and p2p and ves:
-            spread = calculate_spread(spot, p2p)
-            logging.info("Spot: %.0f | P2P: %.0f | VES: %.0f | Spread: %.2f%%", spot, p2p, ves, spread)
-
-            now = time.time()
-            if spread >= THRESHOLD_PCT and (now - last_alert_time) > ALERT_COOLDOWN:
-                msg = format_alert(spot, p2p, ves, spread)
-                send_telegram(msg)
-                last_alert_time = now
-        else:
-            logging.warning("No se pudieron obtener todos los precios.")
-
-        time.sleep(CHECK_INTERVAL)
-
-
+        # Get updates from Telegram
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            res = requests.get(url, params={"offset": offset, "timeout": 30}, timeout=35)
+            res.raise_for_status()
+            updates = res.json().get("result", [])
+            
+            for update in updates:
+                offset = update["update_id"] + 1
+                
+                if "message" in update:
+                    msg = update["message"]
+                    if msg.get("text") == "/start":
+                        send_telegram(
+                            f"✅ <b>Bot iniciado</b>\nMonitoreando USDT/ARS cada {CHECK_INTERVAL}s\nUmbral de alerta: {THRESHOLD_PCT}%"
+                        )
+        except Exception as e:
+            logging.warning(f"Error getting updates: {e}")
+        
+        # Check prices every CHECK_INTERVAL seconds
+        now = time.time()
+        if now - price_check_time >= CHECK_INTERVAL:
+            spot = fetch_ars_price()
+            p2p = fetch_p2p_price()
+            ves = fetch_ves_rate()
+            
+            if spot and p2p and ves:
+                spread = calculate_spread(spot, p2p)
+                logging.info("Spot: %.0f | P2P: %.0f | VES: %.0f | Spread: %.2f%%", spot, p2p, ves, spread)
+                
+                if spread >= THRESHOLD_PCT and (now - last_alert_time) > ALERT_COOLDOWN:
+                    msg = format_alert(spot, p2p, ves, spread)
+                    send_telegram(msg)
+                    last_alert_time = now
+            else:
+                logging.warning("No se pudieron obtener todos los precios.")
+            
+            price_check_time = now
+        
+        time.sleep(1)
 if __name__ == "__main__":
     main()
