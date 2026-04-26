@@ -8,11 +8,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "3.0"))
+THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "0.5"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 
+# Precios anteriores para comparar
+last_spot = None
+last_p2p = None
 last_alert_time = 0
-ALERT_COOLDOWN = 1800
+ALERT_COOLDOWN = 300  # 5 minutos entre alertas del mismo tipo
 
 
 def send_telegram(message: str):
@@ -30,169 +33,104 @@ def send_telegram(message: str):
         logging.error(f"Error enviando Telegram: {e}")
 
 
-def fetch_ars_price() -> float | None:
-    """USDT/ARS via criptoya.com — agrega precios de múltiples exchanges."""
-    sources = [
-        ("https://criptoya.com/api/usdt/ars/1", ["totalAsk", "totalBid", "ask", "bid"]),
-        ("https://api.bluelytics.com.ar/v2/latest", None),  # fallback dólar blue
-    ]
-    # Fuente 1: criptoya
+def fetch_spot_price() -> float | None:
+    """USDT/ARS Spot via criptoya."""
     try:
         res = requests.get("https://criptoya.com/api/usdt/ars/1", timeout=10)
         res.raise_for_status()
         data = res.json()
-        # Busca el precio en distintos exchanges conocidos
         for exchange in ["lemoncash", "ripio", "belo", "buenbit", "satoshitango"]:
             if exchange in data:
                 price = data[exchange].get("totalAsk") or data[exchange].get("ask")
                 if price:
-                    logging.info(f"Precio ARS obtenido de criptoya/{exchange}: {price}")
+                    logging.info(f"Spot de criptoya/{exchange}: {price}")
                     return float(price)
     except Exception as e:
-        logging.warning(f"Error criptoya: {e}")
-
-    # Fuente 2: dolarito
-    try:
-        res = requests.get("https://api.dolarito.ar/api/frontend/usdt", timeout=10)
-        res.raise_for_status()
-        data = res.json()
-        price = data.get("sell") or data.get("buy")
-        if price:
-            logging.info(f"Precio ARS obtenido de dolarito: {price}")
-            return float(price)
-    except Exception as e:
-        logging.warning(f"Error dolarito: {e}")
-
-    # Fuente 3: bluelytics (dólar blue como referencia base)
-    try:
-        res = requests.get("https://api.bluelytics.com.ar/v2/latest", timeout=10)
-        res.raise_for_status()
-        data = res.json()
-        price = data.get("blue", {}).get("value_sell")
-        if price:
-            logging.info(f"Precio ARS obtenido de bluelytics (blue): {price}")
-            return float(price)
-    except Exception as e:
-        logging.warning(f"Error bluelytics: {e}")
-
+        logging.warning(f"Error spot: {e}")
     return None
 
 
 def fetch_p2p_price() -> float | None:
-    """USDT/ARS P2P via criptoya — promedio de vendors P2P."""
+    """USDT/ARS P2P via criptoya."""
     try:
         res = requests.get("https://criptoya.com/api/usdt/ars/1", timeout=10)
         res.raise_for_status()
         data = res.json()
-        # Busca exchanges con mayor spread (más parecidos a P2P)
         for exchange in ["fiwind", "decrypto", "tiendacrypto", "bitso"]:
             if exchange in data:
                 price = data[exchange].get("totalAsk") or data[exchange].get("ask")
                 if price:
-                    logging.info(f"Precio P2P obtenido de criptoya/{exchange}: {price}")
+                    logging.info(f"P2P de criptoya/{exchange}: {price}")
                     return float(price)
     except Exception as e:
-        logging.warning(f"Error P2P criptoya: {e}")
+        logging.warning(f"Error P2P: {e}")
     return None
 
 
-def fetch_ves_rate() -> float | None:
-    """Tasa de referencia USD/VES via exchangerate.host (no requiere key)."""
-    try:
-        res = requests.get(
-            "https://open.er-api.com/v6/latest/USD",
-            timeout=10,
-        )
-        res.raise_for_status()
-        data = res.json()
-        ves = data.get("rates", {}).get("VES")
-        if ves:
-            return float(ves)
-    except Exception as e:
-        logging.warning(f"Error VES er-api: {e}")
-
-    # Fallback
-    try:
-        res = requests.get(
-            "https://api.exchangerate-api.com/v4/latest/USD",
-            timeout=10,
-        )
-        res.raise_for_status()
-        ves = res.json().get("rates", {}).get("VES")
-        if ves:
-            return float(ves)
-    except Exception as e:
-        logging.warning(f"Error VES fallback: {e}")
-
-    return None
+def pct_change(old: float, new: float) -> float:
+    return ((new - old) / old) * 100
 
 
-def calculate_spread(spot: float, p2p: float) -> float:
-    return ((p2p - spot) / spot) * 100
+def direction(change: float) -> str:
+    return "📈 SUBE" if change > 0 else "📉 BAJA"
 
 
-def format_alert(spot, p2p, ves, spread) -> str:
+def format_alert(tipo: str, precio_anterior: float, precio_actual: float, cambio: float) -> str:
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
-    status = "🟢 <b>OPERAR AHORA</b>" if spread >= THRESHOLD_PCT else "🔴 Spread bajo umbral"
+    signo = "+" if cambio > 0 else ""
     return (
-        f"📊 <b>Monitor USDT — {now}</b>\n\n"
-        f"🇦🇷 Spot (ARS): <b>${spot:,.0f}</b>\n"
-        f"🇦🇷 P2P  (ARS): <b>${p2p:,.0f}</b>\n"
-        f"🇻🇪 Ref  (VES): <b>Bs {ves:,.0f}</b>\n\n"
-        f"📈 Spread: <b>{spread:.2f}%</b>\n"
-        f"⚡ Umbral: {THRESHOLD_PCT}%\n\n"
-        f"{status}"
+        f"⚡ <b>Variación USDT/{tipo} — {now}</b>\n\n"
+        f"{direction(cambio)}\n\n"
+        f"Anterior: <b>${precio_anterior:,.0f}</b>\n"
+        f"Actual:   <b>${precio_actual:,.0f}</b>\n\n"
+        f"Cambio: <b>{signo}{cambio:.2f}%</b>\n"
+        f"Umbral configurado: {THRESHOLD_PCT}%"
     )
 
 
 def main():
-    global last_alert_time
-    
-    logging.info("Bot iniciado. Umbral: %.1f%% | Intervalo: %ds", THRESHOLD_PCT, CHECK_INTERVAL)
-    
-    offset = 0
-    price_check_time = 0
-    
+    global last_spot, last_p2p, last_alert_time
+
+    logging.info("Bot iniciado. Umbral: %.2f%% | Intervalo: %ds", THRESHOLD_PCT, CHECK_INTERVAL)
+    send_telegram(
+        f"✅ <b>Bot de variación iniciado</b>\n"
+        f"Monitoreo: USDT Spot y P2P (ARS)\n"
+        f"Alerta si cambia ±{THRESHOLD_PCT}%\n"
+        f"Frecuencia: cada {CHECK_INTERVAL}s"
+    )
+
     while True:
-        # Get updates from Telegram
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-            res = requests.get(url, params={"offset": offset, "timeout": 30}, timeout=35)
-            res.raise_for_status()
-            updates = res.json().get("result", [])
-            
-            for update in updates:
-                offset = update["update_id"] + 1
-                
-                if "message" in update:
-                    msg = update["message"]
-                    if msg.get("text") == "/start":
-                        send_telegram(
-                            f"✅ <b>Bot iniciado</b>\nMonitoreando USDT/ARS cada {CHECK_INTERVAL}s\nUmbral de alerta: {THRESHOLD_PCT}%"
-                        )
-        except Exception as e:
-            logging.warning(f"Error getting updates: {e}")
-        
-        # Check prices every CHECK_INTERVAL seconds
+        spot = fetch_spot_price()
+        p2p = fetch_p2p_price()
         now = time.time()
-        if now - price_check_time >= CHECK_INTERVAL:
-            spot = fetch_ars_price()
-            p2p = fetch_p2p_price()
-            ves = fetch_ves_rate()
-            
-            if spot and p2p and ves:
-                spread = calculate_spread(spot, p2p)
-                logging.info("Spot: %.0f | P2P: %.0f | VES: %.0f | Spread: %.2f%%", spot, p2p, ves, spread)
-                
-                if spread >= THRESHOLD_PCT and (now - last_alert_time) > ALERT_COOLDOWN:
-                    msg = format_alert(spot, p2p, ves, spread)
+
+        # Chequear variación Spot
+        if spot:
+            if last_spot is not None:
+                cambio_spot = pct_change(last_spot, spot)
+                if abs(cambio_spot) >= THRESHOLD_PCT and (now - last_alert_time) > ALERT_COOLDOWN:
+                    msg = format_alert("Spot", last_spot, spot, cambio_spot)
                     send_telegram(msg)
                     last_alert_time = now
-            else:
-                logging.warning("No se pudieron obtener todos los precios.")
-            
-            price_check_time = now
-        
-        time.sleep(1)
+                    logging.info(f"Alerta Spot enviada: {cambio_spot:.2f}%")
+            last_spot = spot
+
+        # Chequear variación P2P
+        if p2p:
+            if last_p2p is not None:
+                cambio_p2p = pct_change(last_p2p, p2p)
+                if abs(cambio_p2p) >= THRESHOLD_PCT and (now - last_alert_time) > ALERT_COOLDOWN:
+                    msg = format_alert("P2P", last_p2p, p2p, cambio_p2p)
+                    send_telegram(msg)
+                    last_alert_time = now
+                    logging.info(f"Alerta P2P enviada: {cambio_p2p:.2f}%")
+            last_p2p = p2p
+
+        if not spot and not p2p:
+            logging.warning("No se pudieron obtener precios.")
+
+        time.sleep(CHECK_INTERVAL)
+
+
 if __name__ == "__main__":
     main()
