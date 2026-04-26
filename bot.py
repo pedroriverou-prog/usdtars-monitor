@@ -8,23 +8,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "0.5"))
+THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "0.2"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 
-# Precios anteriores para comparar
 last_spot = None
 last_p2p = None
+last_ves = None
 last_alert_time = 0
-ALERT_COOLDOWN = 300  # 5 minutos entre alertas del mismo tipo
+ALERT_COOLDOWN = 300
 
 
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         res = requests.post(url, json=payload, timeout=10)
         res.raise_for_status()
@@ -34,7 +30,6 @@ def send_telegram(message: str):
 
 
 def fetch_spot_price() -> float | None:
-    """USDT/ARS Spot via criptoya."""
     try:
         res = requests.get("https://criptoya.com/api/usdt/ars/1", timeout=10)
         res.raise_for_status()
@@ -50,8 +45,7 @@ def fetch_spot_price() -> float | None:
     return None
 
 
-def fetch_p2p_price() -> float | None:
-    """USDT/ARS P2P via criptoya."""
+def fetch_p2p_ars_price() -> float | None:
     try:
         res = requests.get("https://criptoya.com/api/usdt/ars/1", timeout=10)
         res.raise_for_status()
@@ -60,10 +54,40 @@ def fetch_p2p_price() -> float | None:
             if exchange in data:
                 price = data[exchange].get("totalAsk") or data[exchange].get("ask")
                 if price:
-                    logging.info(f"P2P de criptoya/{exchange}: {price}")
+                    logging.info(f"P2P ARS de criptoya/{exchange}: {price}")
                     return float(price)
     except Exception as e:
-        logging.warning(f"Error P2P: {e}")
+        logging.warning(f"Error P2P ARS: {e}")
+    return None
+
+
+def fetch_ves_rate() -> float | None:
+    try:
+        res = requests.get(
+            "https://api.monitordolarvenezuela.com/",
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        res.raise_for_status()
+        data = res.json()
+        for key in ["enparalelovzla", "paralelo", "dolarToday"]:
+            if key in data:
+                price = data[key].get("price") or data[key].get("value")
+                if price:
+                    logging.info(f"VES paralelo/{key}: {price}")
+                    return float(price)
+    except Exception as e:
+        logging.warning(f"Error monitordolar: {e}")
+
+    try:
+        res = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+        res.raise_for_status()
+        ves = res.json().get("rates", {}).get("VES")
+        if ves:
+            logging.info(f"VES de er-api: {ves}")
+            return float(ves)
+    except Exception as e:
+        logging.warning(f"Error VES fallback: {e}")
     return None
 
 
@@ -75,58 +99,57 @@ def direction(change: float) -> str:
     return "📈 SUBE" if change > 0 else "📉 BAJA"
 
 
-def format_alert(tipo: str, precio_anterior: float, precio_actual: float, cambio: float) -> str:
+def format_alert(tipo: str, moneda: str, anterior: float, actual: float, cambio: float) -> str:
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     signo = "+" if cambio > 0 else ""
+    simbolo = "Bs" if moneda == "VES" else "$"
     return (
-        f"⚡ <b>Variación USDT/{tipo} — {now}</b>\n\n"
+        f"⚡ <b>Variación {tipo} — {now}</b>\n\n"
         f"{direction(cambio)}\n\n"
-        f"Anterior: <b>${precio_anterior:,.0f}</b>\n"
-        f"Actual:   <b>${precio_actual:,.0f}</b>\n\n"
+        f"Anterior: <b>{simbolo}{anterior:,.2f}</b>\n"
+        f"Actual:   <b>{simbolo}{actual:,.2f}</b>\n\n"
         f"Cambio: <b>{signo}{cambio:.2f}%</b>\n"
-        f"Umbral configurado: {THRESHOLD_PCT}%"
+        f"Umbral: ±{THRESHOLD_PCT}%"
     )
+
+
+def check_and_alert(tipo, moneda, actual, anterior, now):
+    global last_alert_time
+    if anterior is None or actual is None:
+        return actual
+    cambio = pct_change(anterior, actual)
+    if abs(cambio) >= THRESHOLD_PCT and (now - last_alert_time) > ALERT_COOLDOWN:
+        send_telegram(format_alert(tipo, moneda, anterior, actual, cambio))
+        last_alert_time = now
+        logging.info(f"Alerta {tipo}: {cambio:.2f}%")
+    return actual
 
 
 def main():
-    global last_spot, last_p2p, last_alert_time
+    global last_spot, last_p2p, last_ves
 
     logging.info("Bot iniciado. Umbral: %.2f%% | Intervalo: %ds", THRESHOLD_PCT, CHECK_INTERVAL)
     send_telegram(
-        f"✅ <b>Bot de variación iniciado</b>\n"
-        f"Monitoreo: USDT Spot y P2P (ARS)\n"
-        f"Alerta si cambia ±{THRESHOLD_PCT}%\n"
-        f"Frecuencia: cada {CHECK_INTERVAL}s"
+        f"✅ <b>Bot de variación iniciado</b>\n\n"
+        f"📊 Monitoreando:\n"
+        f"  • USDT/ARS Spot\n"
+        f"  • USDT/ARS P2P\n"
+        f"  • USD/VES Paralelo\n\n"
+        f"⚡ Alerta si cambia ±{THRESHOLD_PCT}%\n"
+        f"🔁 Frecuencia: cada {CHECK_INTERVAL}s"
     )
 
     while True:
-        spot = fetch_spot_price()
-        p2p = fetch_p2p_price()
         now = time.time()
+        spot = fetch_spot_price()
+        p2p = fetch_p2p_ars_price()
+        ves = fetch_ves_rate()
 
-        # Chequear variación Spot
-        if spot:
-            if last_spot is not None:
-                cambio_spot = pct_change(last_spot, spot)
-                if abs(cambio_spot) >= THRESHOLD_PCT and (now - last_alert_time) > ALERT_COOLDOWN:
-                    msg = format_alert("Spot", last_spot, spot, cambio_spot)
-                    send_telegram(msg)
-                    last_alert_time = now
-                    logging.info(f"Alerta Spot enviada: {cambio_spot:.2f}%")
-            last_spot = spot
+        last_spot = check_and_alert("USDT/ARS Spot", "ARS", spot, last_spot, now)
+        last_p2p = check_and_alert("USDT/ARS P2P", "ARS", p2p, last_p2p, now)
+        last_ves = check_and_alert("USD/VES Paralelo", "VES", ves, last_ves, now)
 
-        # Chequear variación P2P
-        if p2p:
-            if last_p2p is not None:
-                cambio_p2p = pct_change(last_p2p, p2p)
-                if abs(cambio_p2p) >= THRESHOLD_PCT and (now - last_alert_time) > ALERT_COOLDOWN:
-                    msg = format_alert("P2P", last_p2p, p2p, cambio_p2p)
-                    send_telegram(msg)
-                    last_alert_time = now
-                    logging.info(f"Alerta P2P enviada: {cambio_p2p:.2f}%")
-            last_p2p = p2p
-
-        if not spot and not p2p:
+        if not any([spot, p2p, ves]):
             logging.warning("No se pudieron obtener precios.")
 
         time.sleep(CHECK_INTERVAL)
