@@ -8,7 +8,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "0.3"))
+THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "0.2"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 
 last_spot = None
@@ -62,23 +62,23 @@ def fetch_p2p_ars_price() -> float | None:
 
 
 def fetch_ves_rate() -> float | None:
+    # Fuente 1: dolarapi.com (paralelo venezolano)
     try:
         res = requests.get(
-            "https://api.monitordolarvenezuela.com/",
+            "https://ve.dolarapi.com/v1/dolares/paralelo",
             timeout=10,
             headers={"User-Agent": "Mozilla/5.0"}
         )
         res.raise_for_status()
         data = res.json()
-        for key in ["enparalelovzla", "paralelo", "dolarToday"]:
-            if key in data:
-                price = data[key].get("price") or data[key].get("value")
-                if price:
-                    logging.info(f"VES paralelo/{key}: {price}")
-                    return float(price)
+        price = data.get("promedio") or data.get("venta")
+        if price:
+            logging.info(f"VES paralelo/dolarapi: {price}")
+            return float(price)
     except Exception as e:
-        logging.warning(f"Error monitordolar: {e}")
+        logging.warning(f"Error dolarapi: {e}")
 
+    # Fallback: open.er-api.com
     try:
         res = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
         res.raise_for_status()
@@ -88,6 +88,7 @@ def fetch_ves_rate() -> float | None:
             return float(ves)
     except Exception as e:
         logging.warning(f"Error VES fallback: {e}")
+
     return None
 
 
