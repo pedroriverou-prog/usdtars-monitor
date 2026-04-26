@@ -8,7 +8,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "0.2"))
+THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "0.3"))
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 
 last_spot = None
